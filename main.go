@@ -10,48 +10,61 @@ import (
     "io"
     "log"
     "net"
+    "os"
     "strings"
+
+    "gopkg.in/yaml.v2"
 )
 
+type Config struct {
+    Mode      string `yaml:"mode"`        // encrypt or decrypt
+    LAddr     string `yaml:"laddr"`       // local listen address (e.g. :1234)
+    RAddr     string `yaml:"raddr"`       // remote forward address (e.g. host:80)
+    Key       string `yaml:"key"`         // AES key (16 bytes)
+    AuthToken string `yaml:"auth"`        // shared auth token
+    BindIP    string `yaml:"bindip"`      // bind IP (default 0.0.0.0)
+}
+
 var (
-    mode      = flag.String("mode", "encrypt", "Mode: encrypt or decrypt")
-    proto     = flag.String("proto", "tcp", "Protocol: tcp or udp")
-    laddr     = flag.String("laddr", ":1234", "Local listen port (e.g. :1234)")
-    raddr     = flag.String("raddr", "", "Remote forward address (e.g. example.com:80)")
-    key       = flag.String("key", "", "AES key (16 bytes)")
-    authToken = flag.String("auth", "", "Shared authentication token")
-    bindIP    = flag.String("bindip", "0.0.0.0", "IP to bind (default 0.0.0.0)")
+    configPath = flag.String("config", "config.yml", "Path to config file")
+    config     Config
 )
 
 func main() {
     flag.Parse()
 
-    if *key == "" || len(*key) != 16 {
+    // load config file
+    f, err := os.ReadFile(*configPath)
+    if err != nil {
+        log.Fatalf("Failed to read config file: %v", err)
+    }
+    if err := yaml.Unmarshal(f, &config); err != nil {
+        log.Fatalf("Failed to parse config file: %v", err)
+    }
+
+    if config.Key == "" || len(config.Key) != 16 {
         log.Fatal("Key must be 16 bytes")
     }
-
-    if *authToken == "" {
+    if config.AuthToken == "" {
         log.Fatal("Authentication token required")
     }
+    if config.BindIP == "" {
+        config.BindIP = "0.0.0.0"
+    }
 
-    aead, err := newCipher([]byte(*key))
+    aead, err := newCipher([]byte(config.Key))
     if err != nil {
         log.Fatalf("AES init failed: %v", err)
     }
 
-    listenAddr := net.JoinHostPort(*bindIP, strings.TrimPrefix(*laddr, ":"))
+    listenAddr := net.JoinHostPort(config.BindIP, strings.TrimPrefix(config.LAddr, ":"))
 
-    switch strings.ToLower(*proto) {
-    case "tcp":
-        if *mode == "encrypt" {
-            tcpEncrypt(listenAddr, *raddr, aead, *authToken)
-        } else {
-            tcpDecrypt(listenAddr, *raddr, aead, *authToken)
-        }
-    case "udp":
-        udpForward(listenAddr, *raddr, *mode == "encrypt", aead)
-    default:
-        log.Fatalf("Unsupported protocol: %s", *proto)
+    if config.Mode == "encrypt" {
+        go tcpEncrypt(listenAddr, config.RAddr, aead, config.AuthToken)
+        udpForward(listenAddr, config.RAddr, true, aead)
+    } else {
+        go tcpDecrypt(listenAddr, config.RAddr, aead, config.AuthToken)
+        udpForward(listenAddr, config.RAddr, false, aead)
     }
 }
 
@@ -63,7 +76,7 @@ func newCipher(key []byte) (cipher.AEAD, error) {
     return cipher.NewGCM(block)
 }
 
-// ==================== TCP ====================
+// ==================== TCP 加密解密 ====================
 
 func tcpEncrypt(l, r string, aead cipher.AEAD, token string) {
     ln, err := net.Listen("tcp", l)
@@ -142,8 +155,6 @@ func tcpDecrypt(l, r string, aead cipher.AEAD, token string) {
         }(in)
     }
 }
-
-// ==================== Encryption Helpers ====================
 
 func encryptAndSend(conn net.Conn, data []byte, aead cipher.AEAD) error {
     nonce := make([]byte, aead.NonceSize())
@@ -260,13 +271,12 @@ func udpForward(l, r string, isEncrypt bool, aead cipher.AEAD) {
     }
 }
 
-// ==================== Auth Handshake ====================
+// ==================== 双向认证握手 ====================
 
 func handshake(conn net.Conn, expectedToken string, isServer bool) error {
     buf := make([]byte, 128)
 
     if isServer {
-        // Server: read client's token
         n, err := conn.Read(buf)
         if err != nil {
             return fmt.Errorf("read client token failed: %v", err)
@@ -274,18 +284,13 @@ func handshake(conn net.Conn, expectedToken string, isServer bool) error {
         if string(buf[:n]) != expectedToken {
             return fmt.Errorf("invalid client token")
         }
-
-        // Send back server token
         _, err = conn.Write([]byte(expectedToken))
         return err
     } else {
-        // Client: send token
         _, err := conn.Write([]byte(expectedToken))
         if err != nil {
             return err
         }
-
-        // Read server token
         n, err := conn.Read(buf)
         if err != nil {
             return err
