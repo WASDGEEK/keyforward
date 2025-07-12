@@ -1,7 +1,4 @@
-# This workflow will build a golang project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
-
-name: Go
+name: Go Cross-Platform Build
 
 on:
   push:
@@ -10,9 +7,17 @@ on:
     branches: [ "main" ]
 
 jobs:
-
   build:
     runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: darwin
+            goarch: arm64  # macOS ARM 构建需要 macOS runner，不支持在 Ubuntu 上构建
+
     steps:
     - uses: actions/checkout@v4
 
@@ -21,8 +26,20 @@ jobs:
       with:
         go-version: '1.24.4'
 
-    - name: Build
-      run: go build -v ./...
+    - name: Build for ${{ matrix.goos }}/${{ matrix.goarch }}
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+      run: |
+        output_name="myapp-${GOOS}-${GOARCH}"
+        if [ "$GOOS" = "windows" ]; then
+          output_name="${output_name}.exe"
+        fi
+        mkdir -p dist
+        go build -o dist/$output_name ./...
 
-    - name: Test
-      run: go test -v ./...
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: cross-platform-builds
+        path: dist/
