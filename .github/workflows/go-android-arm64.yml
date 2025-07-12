@@ -10,7 +10,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
     - name: Set up Go
       uses: actions/setup-go@v4
@@ -29,7 +30,6 @@ jobs:
         GOARCH: arm64
         CGO_ENABLED: 1
         CC: ${{ runner.temp }}/android-ndk-r25b/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
-        PATH: ${{ runner.temp }}/android-ndk-r25b/toolchains/llvm/prebuilt/linux-x86_64/bin:${{ env.PATH }}
       run: |
         mkdir -p dist
         echo "Using CC: $CC"
