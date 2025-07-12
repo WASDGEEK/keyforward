@@ -1,4 +1,4 @@
-name: Go Cross-Platform Build
+name: Go Selective Cross-Platform Build
 
 on:
   push:
@@ -7,16 +7,19 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
+  build-linux-windows-android:
     runs-on: ubuntu-latest
-
     strategy:
       matrix:
-        goos: [linux, windows, darwin]
-        goarch: [amd64, arm64]
-        exclude:
-          - goos: darwin
-            goarch: arm64  # macOS ARM 构建需要 macOS runner，不支持在 Ubuntu 上构建
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm
+          - goos: windows
+            goarch: amd64
+          - goos: android
+            goarch: arm
 
     steps:
     - uses: actions/checkout@v4
@@ -31,15 +34,57 @@ jobs:
         GOOS: ${{ matrix.goos }}
         GOARCH: ${{ matrix.goarch }}
       run: |
-        output_name="myapp-${GOOS}-${GOARCH}"
-        if [ "$GOOS" = "windows" ]; then
-          output_name="${output_name}.exe"
-        fi
         mkdir -p dist
-        go build -o dist/$output_name ./...
+        output="keyforward-${GOOS}-${GOARCH}"
+        if [ "$GOOS" = "windows" ]; then
+          output="${output}.exe"
+        fi
+        go build -o "dist/$output" ./...
 
-    - name: Upload build artifacts
+    - name: Compress Binary
+      run: |
+        cd dist
+        base="keyforward-${{ matrix.goos }}-${{ matrix.goarch }}"
+        if [ "${{ matrix.goos }}" = "windows" ]; then
+          zip "${base}.zip" "${base}.exe"
+          rm "${base}.exe"
+        else
+          tar -czf "${base}.tar.gz" "${base}"
+          rm "${base}"
+        fi
+
+    - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: cross-platform-builds
+        name: builds-linux-windows-android
+        path: dist/
+
+  build-macos-arm64:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.24.4'
+
+    - name: Build for darwin/arm64
+      env:
+        GOOS: darwin
+        GOARCH: arm64
+      run: |
+        mkdir -p dist
+        go build -o dist/keyforward-darwin-arm64 ./...
+
+    - name: Compress Binary
+      run: |
+        cd dist
+        tar -czf keyforward-darwin-arm64.tar.gz keyforward-darwin-arm64
+        rm keyforward-darwin-arm64
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-macos-arm64
         path: dist/
