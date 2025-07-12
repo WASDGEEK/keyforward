@@ -1,4 +1,4 @@
-name: Go Selective Cross-Platform Build
+name: Go Cross-Platform Build
 
 on:
   push:
@@ -7,9 +7,10 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build-linux-windows-android:
+  build-matrix:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - goos: linux
@@ -18,8 +19,6 @@ jobs:
             goarch: arm
           - goos: windows
             goarch: amd64
-          - goos: android
-            goarch: arm
 
     steps:
     - uses: actions/checkout@v4
@@ -33,6 +32,7 @@ jobs:
       env:
         GOOS: ${{ matrix.goos }}
         GOARCH: ${{ matrix.goarch }}
+        CGO_ENABLED: 0
       run: |
         mkdir -p dist
         output="keyforward-${GOOS}-${GOARCH}"
@@ -41,7 +41,7 @@ jobs:
         fi
         go build -o "dist/$output" ./...
 
-    - name: Compress Binary
+    - name: Compress
       run: |
         cd dist
         base="keyforward-${{ matrix.goos }}-${{ matrix.goarch }}"
@@ -56,7 +56,7 @@ jobs:
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: builds-linux-windows-android
+        name: builds-${{ matrix.goos }}-${{ matrix.goarch }}
         path: dist/
 
   build-macos-arm64:
@@ -69,15 +69,16 @@ jobs:
       with:
         go-version: '1.24.4'
 
-    - name: Build for darwin/arm64
+    - name: Build for macOS ARM64
       env:
         GOOS: darwin
         GOARCH: arm64
+        CGO_ENABLED: 0
       run: |
         mkdir -p dist
         go build -o dist/keyforward-darwin-arm64 ./...
 
-    - name: Compress Binary
+    - name: Compress
       run: |
         cd dist
         tar -czf keyforward-darwin-arm64.tar.gz keyforward-darwin-arm64
@@ -86,5 +87,5 @@ jobs:
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: build-macos-arm64
+        name: build-darwin-arm64
         path: dist/
