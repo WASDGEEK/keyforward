@@ -12,107 +12,107 @@ import (
     "net"
     "os"
     "strings"
+    "time"
 
     "gopkg.in/yaml.v2"
 )
 
 type Config struct {
-    Mode      string `yaml:"mode"`        // encrypt or decrypt
-    LAddr     string `yaml:"laddr"`       // local listen address (e.g. :1234)
-    RAddr     string `yaml:"raddr"`       // remote forward address (e.g. host:80)
-    Key       string `yaml:"key"`         // AES key (16 bytes)
-    AuthToken string `yaml:"auth"`        // shared auth token
-    BindIP    string `yaml:"bindip"`      // bind IP (default 0.0.0.0)
+    Mode      string `yaml:"mode"`
+    LAddr     string `yaml:"laddr"`
+    RAddr     string `yaml:"raddr"`
+    Key       string `yaml:"key"`
+    AuthToken string `yaml:"auth"`
+    BindIP    string `yaml:"bindip"`
+    LogLevel  string `yaml:"loglevel"`
 }
 
 var (
     configPath = flag.String("config", "config.yml", "Path to config file")
-    config     Config
+    cfg        Config
+    debug      bool
 )
+
+func debugLog(format string, args ...any) {
+    if debug {
+        log.Printf(format, args...)
+    }
+}
 
 func main() {
     flag.Parse()
 
-    // load config file
-    f, err := os.ReadFile(*configPath)
+    raw, err := os.ReadFile(*configPath)
     if err != nil {
-        log.Fatalf("Failed to read config file: %v", err)
+        log.Fatalf("read config: %v", err)
     }
-    if err := yaml.Unmarshal(f, &config); err != nil {
-        log.Fatalf("Failed to parse config file: %v", err)
-    }
-
-    if config.Key == "" || len(config.Key) != 16 {
-        log.Fatal("Key must be 16 bytes")
-    }
-    if config.AuthToken == "" {
-        log.Fatal("Authentication token required")
-    }
-    if config.BindIP == "" {
-        config.BindIP = "0.0.0.0"
+    if err := yaml.Unmarshal(raw, &cfg); err != nil {
+        log.Fatalf("parse config: %v", err)
     }
 
-    aead, err := newCipher([]byte(config.Key))
+    if len(cfg.Key) != 16 {
+        log.Fatal("key must be 16 bytes")
+    }
+    if cfg.AuthToken == "" {
+        log.Fatal("auth token required")
+    }
+    if cfg.BindIP == "" {
+        cfg.BindIP = "0.0.0.0"
+    }
+    debug = strings.ToLower(cfg.LogLevel) == "debug"
+
+    aead, err := newCipher([]byte(cfg.Key))
     if err != nil {
-        log.Fatalf("AES init failed: %v", err)
+        log.Fatalf("cipher init: %v", err)
     }
 
-    listenAddr := net.JoinHostPort(config.BindIP, strings.TrimPrefix(config.LAddr, ":"))
+    listenAddr := net.JoinHostPort(cfg.BindIP, strings.TrimPrefix(cfg.LAddr, ":"))
 
-    if config.Mode == "encrypt" {
-        go tcpEncrypt(listenAddr, config.RAddr, aead, config.AuthToken)
-        udpForward(listenAddr, config.RAddr, true, aead)
+    if strings.ToLower(cfg.Mode) == "encrypt" {
+        go tcpEncrypt(listenAddr, cfg.RAddr, aead, cfg.AuthToken)
+        udpForward(listenAddr, cfg.RAddr, true, aead)
     } else {
-        go tcpDecrypt(listenAddr, config.RAddr, aead, config.AuthToken)
-        udpForward(listenAddr, config.RAddr, false, aead)
+        go tcpDecrypt(listenAddr, cfg.RAddr, aead, cfg.AuthToken)
+        udpForward(listenAddr, cfg.RAddr, false, aead)
     }
 }
 
 func newCipher(key []byte) (cipher.AEAD, error) {
-    block, err := aes.NewCipher(key)
+    blk, err := aes.NewCipher(key)
     if err != nil {
         return nil, err
     }
-    return cipher.NewGCM(block)
+    return cipher.NewGCM(blk)
 }
-
-// ==================== TCP 加密解密 ====================
 
 func tcpEncrypt(l, r string, aead cipher.AEAD, token string) {
     ln, err := net.Listen("tcp", l)
     if err != nil {
-        log.Fatalf("Listen error: %v", err)
+        log.Fatalf("listen: %v", err)
     }
-    log.Printf("[TCP Encrypt] Listening on %s, forwarding to %s", l, r)
+    log.Printf("[TCP-Encrypt] %s -> %s", l, r)
 
     for {
         in, err := ln.Accept()
         if err != nil {
-            log.Println("Accept error:", err)
+            log.Println("accept:", err)
             continue
         }
-
         go func(in net.Conn) {
             defer in.Close()
-
             out, err := net.Dial("tcp", r)
             if err != nil {
-                log.Println("Dial error:", err)
+                log.Println("dial remote:", err)
                 return
             }
             defer out.Close()
 
-            if err := handshake(in, token, true); err != nil {
-                log.Println("Client handshake failed:", err)
-                return
-            }
             if err := handshake(out, token, false); err != nil {
-                log.Println("Server handshake failed:", err)
+                log.Println("handshake remote:", err)
                 return
             }
 
-            go io.Copy(out, &decryptReader{conn: in, aead: aead})
-            encryptWriter(in, out, aead)
+            proxyTCPEncrypted(in, out, aead)
         }(in)
     }
 }
@@ -120,39 +120,65 @@ func tcpEncrypt(l, r string, aead cipher.AEAD, token string) {
 func tcpDecrypt(l, r string, aead cipher.AEAD, token string) {
     ln, err := net.Listen("tcp", l)
     if err != nil {
-        log.Fatalf("Listen error: %v", err)
+        log.Fatalf("listen: %v", err)
     }
-    log.Printf("[TCP Decrypt] Listening on %s, forwarding to %s", l, r)
+    log.Printf("[TCP-Decrypt] %s -> %s", l, r)
 
     for {
         in, err := ln.Accept()
         if err != nil {
-            log.Println("Accept error:", err)
+            log.Println("accept:", err)
             continue
         }
-
         go func(in net.Conn) {
-            defer in.Close()
+            if err := handshake(in, token, true); err != nil {
+                log.Println("handshake client:", err)
+                in.Close()
+                return
+            }
 
             out, err := net.Dial("tcp", r)
             if err != nil {
-                log.Println("Dial error:", err)
+                log.Println("dial dest:", err)
+                in.Close()
                 return
             }
             defer out.Close()
+            defer in.Close()
 
-            if err := handshake(in, token, true); err != nil {
-                log.Println("Client handshake failed:", err)
-                return
-            }
-            if err := handshake(out, token, false); err != nil {
-                log.Println("Server handshake failed:", err)
-                return
-            }
-
-            go io.Copy(out, &decryptReader{conn: in, aead: aead})
-            encryptWriter(in, out, aead)
+            proxyTCPEncrypted(out, in, aead)
         }(in)
+    }
+}
+
+func proxyTCPEncrypted(src, dst net.Conn, aead cipher.AEAD) {
+    go func() {
+        buf := make([]byte, 4096)
+        for {
+            n, err := src.Read(buf)
+            if err != nil {
+                log.Println("proxy read err:", err)
+                return
+            }
+            debugLog("Encrypting and forwarding %d bytes", n)
+            if err := encryptAndSend(dst, buf[:n], aead); err != nil {
+                log.Println("encrypt send err:", err)
+                return
+            }
+        }
+    }()
+
+    for {
+        data, err := recvAndDecrypt(dst, aead)
+        if err != nil {
+            log.Println("decrypt recv err:", err)
+            return
+        }
+        debugLog("Decrypted and writing %d bytes", len(data))
+        if _, err := src.Write(data); err != nil {
+            log.Println("write back err:", err)
+            return
+        }
     }
 }
 
@@ -161,143 +187,130 @@ func encryptAndSend(conn net.Conn, data []byte, aead cipher.AEAD) error {
     if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
         return err
     }
-
-    ciphertext := aead.Seal(nil, nonce, data, nil)
-    total := append(nonce, ciphertext...)
-
-    length := make([]byte, 4)
-    binary.BigEndian.PutUint32(length, uint32(len(total)))
-
-    _, err := conn.Write(append(length, total...))
+    ct := aead.Seal(nil, nonce, data, nil)
+    packet := append(nonce, ct...)
+    hdr := make([]byte, 4)
+    binary.BigEndian.PutUint32(hdr, uint32(len(packet)))
+    _, err := conn.Write(append(hdr, packet...))
     return err
 }
 
 func recvAndDecrypt(conn net.Conn, aead cipher.AEAD) ([]byte, error) {
-    header := make([]byte, 4)
-    if _, err := io.ReadFull(conn, header); err != nil {
+    hdr := make([]byte, 4)
+    if _, err := io.ReadFull(conn, hdr); err != nil {
         return nil, err
     }
-    totalLen := binary.BigEndian.Uint32(header)
-    buf := make([]byte, totalLen)
+    n := binary.BigEndian.Uint32(hdr)
+    buf := make([]byte, n)
     if _, err := io.ReadFull(conn, buf); err != nil {
         return nil, err
     }
-
     nonceSize := aead.NonceSize()
     if len(buf) < nonceSize {
         return nil, fmt.Errorf("ciphertext too short")
     }
-
-    nonce := buf[:nonceSize]
-    ciphertext := buf[nonceSize:]
-    return aead.Open(nil, nonce, ciphertext, nil)
+    return aead.Open(nil, buf[:nonceSize], buf[nonceSize:], nil)
 }
 
-func encryptWriter(dst net.Conn, src net.Conn, aead cipher.AEAD) {
-    buf := make([]byte, 4096)
-    for {
-        n, err := src.Read(buf)
-        if err != nil {
-            return
-        }
-        if err := encryptAndSend(dst, buf[:n], aead); err != nil {
-            return
-        }
-    }
-}
-
-type decryptReader struct {
-    conn net.Conn
-    aead cipher.AEAD
-}
-
-func (d *decryptReader) Read(p []byte) (int, error) {
-    data, err := recvAndDecrypt(d.conn, d.aead)
-    if err != nil {
-        return 0, err
-    }
-    return copy(p, data), nil
-}
-
-// ==================== UDP ====================
-
-func udpForward(l, r string, isEncrypt bool, aead cipher.AEAD) {
+func udpForward(l, r string, encrypt bool, aead cipher.AEAD) {
     conn, err := net.ListenPacket("udp", l)
     if err != nil {
-        log.Fatal("UDP listen failed:", err)
+        log.Fatalf("udp listen: %v", err)
     }
     defer conn.Close()
-
-    log.Printf("[UDP %s] Listening on %s, forwarding to %s", strings.ToUpper(map[bool]string{true: "Encrypt", false: "Decrypt"}[isEncrypt]), l, r)
+    log.Printf("[UDP-%s] %s <-> %s", map[bool]string{true: "Encrypt", false: "Decrypt"}[encrypt], l, r)
 
     buf := make([]byte, 4096)
+
     for {
-        n, addr, err := conn.ReadFrom(buf)
+        n, clientAddr, err := conn.ReadFrom(buf)
         if err != nil {
-            log.Println("UDP read error:", err)
+            log.Println("udp read:", err)
             continue
         }
 
-        var data []byte
-        if isEncrypt {
-            nonce := make([]byte, aead.NonceSize())
-            if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-                continue
+        go func(data []byte, addr net.Addr) {
+            var outData []byte
+            if encrypt {
+                nonce := make([]byte, aead.NonceSize())
+                if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+                    return
+                }
+                outData = append(nonce, aead.Seal(nil, nonce, data, nil)...)
+            } else {
+                if len(data) < aead.NonceSize() {
+                    return
+                }
+                nonce := data[:aead.NonceSize()]
+                pt, err := aead.Open(nil, nonce, data[aead.NonceSize():], nil)
+                if err != nil {
+                    return
+                }
+                outData = pt
             }
-            data = append(nonce, aead.Seal(nil, nonce, buf[:n], nil)...)
-        } else {
-            nonceSize := aead.NonceSize()
-            if n < nonceSize {
-                continue
-            }
-            nonce := buf[:nonceSize]
-            ct := buf[nonceSize:n]
-            data, err = aead.Open(nil, nonce, ct, nil)
+
+            remote, err := net.Dial("udp", r)
             if err != nil {
-                log.Println("UDP decrypt failed:", err)
-                continue
+                log.Println("udp dial:", err)
+                return
             }
-        }
+            defer remote.Close()
+            remote.Write(outData)
 
-        dst, err := net.Dial("udp", r)
-        if err != nil {
-            log.Println("UDP dial error:", err)
-            continue
-        }
-        dst.Write(data)
-        dst.Close()
+            remote.SetReadDeadline(time.Now().Add(2 * time.Second))
+            n, err := remote.Read(buf)
+            if err != nil {
+                return
+            }
 
-        _ = addr // 可用于响应
+            resp := buf[:n]
+            var sendBack []byte
+            if encrypt {
+                if len(resp) < aead.NonceSize() {
+                    return
+                }
+                nonce := resp[:aead.NonceSize()]
+                pt, err := aead.Open(nil, nonce, resp[aead.NonceSize():], nil)
+                if err != nil {
+                    return
+                }
+                sendBack = pt
+            } else {
+                nonce := make([]byte, aead.NonceSize())
+                if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+                    return
+                }
+                sendBack = append(nonce, aead.Seal(nil, nonce, resp, nil)...)
+            }
+
+            conn.WriteTo(sendBack, addr)
+
+        }(buf[:n], clientAddr)
     }
 }
 
-// ==================== 双向认证握手 ====================
-
-func handshake(conn net.Conn, expectedToken string, isServer bool) error {
+func handshake(conn net.Conn, token string, server bool) error {
     buf := make([]byte, 128)
-
-    if isServer {
+    if server {
         n, err := conn.Read(buf)
         if err != nil {
-            return fmt.Errorf("read client token failed: %v", err)
+            return fmt.Errorf("read token: %v", err)
         }
-        if string(buf[:n]) != expectedToken {
+        if string(buf[:n]) != token {
             return fmt.Errorf("invalid client token")
         }
-        _, err = conn.Write([]byte(expectedToken))
+        _, err = conn.Write([]byte(token))
         return err
-    } else {
-        _, err := conn.Write([]byte(expectedToken))
-        if err != nil {
-            return err
-        }
-        n, err := conn.Read(buf)
-        if err != nil {
-            return err
-        }
-        if string(buf[:n]) != expectedToken {
-            return fmt.Errorf("invalid server token")
-        }
-        return nil
     }
+    if _, err := conn.Write([]byte(token)); err != nil {
+        return err
+    }
+    n, err := conn.Read(buf)
+    if err != nil {
+        return err
+    }
+    if string(buf[:n]) != token {
+        return fmt.Errorf("invalid server token")
+    }
+    return nil
 }
